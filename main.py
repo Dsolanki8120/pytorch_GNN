@@ -1,252 +1,216 @@
-# main.py
+# main.py — Feature normalization only (no target normalization)
 import torch
-import torch.nn as nn
-import torch.optim as optim
 import torch.nn.functional as F
+import torch.optim as optim
 import numpy as np
-import os
-import re # Import the regular expression module
-from collections import deque
-import pandas as pd
+import matplotlib.pyplot as plt
+import os, re
+from datetime import datetime
 from torch.utils.tensorboard import SummaryWriter
 import graph
 import model as gnn_model
-# import vis
 
-# --- Global Configuration ---
+# --- Global Config ---
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {DEVICE}")
-
 CURRENT_DIR = os.getcwd()
-DATA_PATH = os.path.join(CURRENT_DIR, 'Trials_1-135')
+DATA_PATH = os.path.join(CURRENT_DIR, "data_sets")
 print("Notebook started")
 
-# Dynamically determine ASSEMBLY_IDS and TIMESTEPS from file names
+# --- Extract assembly/timestep info ---
 def get_data_info(data_path):
     assembly_ids = set()
     timesteps = set()
-    
-    # Regex to find assembly ID and timestep from file names like "134_18_contact_end1.tab"
-    pattern = re.compile(r'(\d+)_(\d+)_ball_NPMNCF\.tab')
-
+    pattern = re.compile(r"(\d+)_(\d+)_ball_NPMNCF\.tab")
     for fname in os.listdir(data_path):
         match = pattern.match(fname)
         if match:
             assembly_ids.add(int(match.group(1)))
             timesteps.add(int(match.group(2)))
-    
     return sorted(list(assembly_ids)), len(timesteps)
 
 ASSEMBLY_IDS, TIMESTEPS = get_data_info(DATA_PATH)
 ASSEMBLY_IDS_TO_PROCESS = ASSEMBLY_IDS[:100]
 print(f"Discovered {len(ASSEMBLY_IDS)} assemblies with {TIMESTEPS} timesteps each.")
 
-from datetime import datetime
-writer = SummaryWriter(f'runs/gnn_training_experiment_{datetime.now().strftime("%d_%m_%y_%H-%M-%S.%f")}')
-
+# --- Logging setup ---
+writer = SummaryWriter(f"runs/gnn_training_experiment_{datetime.now().strftime('%d_%m_%y_%H-%M-%S.%f')}")
 graph.set_global_paths_and_device(DATA_PATH, DEVICE, TIMESTEPS)
 gnn_model.set_device_for_model(DEVICE)
 
-
-# --- Data Loading with Save/Load Mechanism ---
-PROCESSED_DATA_FILE = 'processed_graphs_and_targets.pt'
-ASSEMBLY_IDS, _ = get_data_info(DATA_PATH)
-
+# --- Load/Process Graphs ---
+PROCESSED_DATA_FILE = "processed_graphs_and_targets.pt"
 if os.path.exists(PROCESSED_DATA_FILE):
     print(f"Loading graphs and targets from {PROCESSED_DATA_FILE}...")
     graphs, targets = torch.load(PROCESSED_DATA_FILE)
-    print("Data loaded successfully.")
 else:
-    print(f"File {PROCESSED_DATA_FILE} not found. Creating graphs...")
-    TIMESTEPS = 21 # Assuming each assembly has 21 timesteps
+    print("Creating graphs...")
+    TIMESTEPS = 81
     graphs, targets = graph.create_all_graphs(assembly_ids=ASSEMBLY_IDS_TO_PROCESS)
-    
-    print("Saving processed graphs and targets...")
     torch.save((graphs, targets), PROCESSED_DATA_FILE)
-    print("Data saved successfully for future use.")
+    print("Data saved successfully.")
 
-# --- Data Splitting with Fixed Counts ---
-NUM_TRAIN = 1500
-NUM_TEST = 400
-
+# --- Train/Test Split ---
+NUM_TRAIN = 800
+NUM_TEST = 800
 total_graphs = len(graphs)
-
-# Ensure you have enough graphs for the requested split
-if total_graphs < NUM_TRAIN + NUM_TEST:
-    raise ValueError(f"Not enough total graphs ({total_graphs}) for the requested split of {NUM_TRAIN} train and {NUM_TEST} test.")
-
-# Shuffle the data to ensure random splits
 indices = np.random.permutation(total_graphs)
-# indices= np.arange(total_graphs)
-
-# Split the indices into train and test sets
 train_indices = indices[:NUM_TRAIN]
 test_indices = indices[NUM_TRAIN:NUM_TRAIN + NUM_TEST]
-
-# Create data splits using the shuffled indices
 train_graph_dicts = [graphs[i] for i in train_indices]
 train_targets = [targets[i] for i in train_indices]
 test_graph_dicts = [graphs[i] for i in test_indices]
 test_targets = [targets[i] for i in test_indices]
 
-# --- Normalization Statistics Calculation ---
-train_graphs_for_stats = train_graph_dicts
-all_nodes_for_norm = torch.cat([g["nodes"].cpu() for g in train_graphs_for_stats], dim=0)
-all_edges_for_norm_list = [g["edges"].cpu() for g in train_graphs_for_stats if g["edges"].numel() > 0]
-
+# --- Feature Normalization (only inputs, not targets) ---
+all_nodes_for_norm = torch.cat([g["nodes"].cpu() for g in train_graph_dicts], dim=0)
 node_mean = all_nodes_for_norm.mean(dim=0, keepdim=True)
 node_std = all_nodes_for_norm.std(dim=0, keepdim=True) + 1e-8
 
-edge_mean = None
-edge_std = None
-if len(all_edges_for_norm_list) > 0:
-    all_edges_for_norm = torch.cat(all_edges_for_norm_list, dim=0)
-    edge_mean = all_edges_for_norm.mean(dim=0, keepdim=True)
-    edge_std = all_edges_for_norm.std(dim=0, keepdim=True) + 1e-8
+all_edges_for_norm = torch.cat([g["edges"].cpu() for g in train_graph_dicts if g["edges"].numel() > 0], dim=0)
+edge_mean = all_edges_for_norm.mean(dim=0, keepdim=True)
+edge_std = all_edges_for_norm.std(dim=0, keepdim=True) + 1e-8
 
-print("Normalization statistics calculated from training graphs.")
+print("✅ Input feature normalization applied (nodes + edges). Targets remain raw.")
 
-# --- Hyperparameters ---
+# --- Hyperparameters (per paper) ---
 num_epochs = 100
 batch_size = 1
-num_processing_steps = 5
-clip_norm = 10000
+num_processing_steps = 7
+clip_norm = 5.0
 learning_rate = 1e-3
 
-print("Number of training graphs:", len(train_graph_dicts))
-print("Number of test graphs:", len(test_graph_dicts))
-print("Batch size:", batch_size)
-
-# --- Model, Loss, and Optimizer ---
+# --- Model Setup ---
 model = gnn_model.EncodeProcessDecode(
     node_input_dim=2,
     edge_input_dim=3,
     node_output_size=1,
 ).to(DEVICE)
 
+optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-5)
 
-optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 num_processing_steps_tensor_for_model = torch.tensor(num_processing_steps, dtype=torch.int32).to(DEVICE)
 
-# --- Training and Test Loop ---
-best_rho_test = -np.inf
+# --- Training history tracking ---
 l1_train_hist, l2_train_hist, rho_train_hist = [], [], []
 l1_test_hist, l2_test_hist, rho_test_hist = [], [], []
 
-print("Starting training...")
+print("🚀 Starting training (feature-normalized, raw targets)...")
 for epoch in range(num_epochs):
     model.train()
+    l1s_train, l2s_train, rhos_train = [], [], []
 
-    idx = np.arange(len(train_graph_dicts))
-    shuffled_train_graphs = [train_graph_dicts[i] for i in idx]
-    shuffled_train_targets = [train_targets[i] for i in idx]
-
-    l1s_train_epoch, l2s_train_epoch, rhos_train_epoch = [], [], []
-
-    for i in range(0, len(shuffled_train_graphs), batch_size):
-        batch_graphs_list = shuffled_train_graphs[i:i+batch_size]
-        batch_targets_list = shuffled_train_targets[i:i+batch_size]
-
-        if not batch_graphs_list:
+    # ---- TRAIN PHASE ----
+    for i in range(0, len(train_graph_dicts), batch_size):
+        batch_graphs = train_graph_dicts[i:i + batch_size]
+        batch_targets = train_targets[i:i + batch_size]
+        if not batch_graphs:
             continue
 
-        # CORRECT: Normalize the training data just before using it
-        normalized_train_graphs = []
-        for g in batch_graphs_list:
-            g_normalized = g.copy()
-            g_normalized["nodes"] = ((g_normalized["nodes"].cpu() - node_mean) / node_std).to(DEVICE)
-            if g_normalized["edges"].numel() > 0 and edge_mean is not None and edge_std is not None:
-                g_normalized["edges"] = ((g_normalized["edges"].cpu() - edge_mean) / edge_std).to(DEVICE)
-            normalized_train_graphs.append(g_normalized)
+        # Normalize only node and edge features
+        normalized_graphs = []
+        for g in batch_graphs:
+            g_norm = g.copy()
+            g_norm["nodes"] = ((g_norm["nodes"].cpu() - node_mean) / node_std).to(DEVICE)
+            if g_norm["edges"].numel() > 0:
+                g_norm["edges"] = ((g_norm["edges"].cpu() - edge_mean) / edge_std).to(DEVICE)
+            normalized_graphs.append(g_norm)
 
-        batch_graphs_tuple = graph.data_dicts_to_graphs_tuple_pytorch(normalized_train_graphs)
-        batch_targets_concat = torch.cat(batch_targets_list, dim=0).to(DEVICE)
-
-        assert batch_graphs_tuple["nodes"].shape[0] == batch_targets_concat.shape[0], "Node count mismatch!"
-
-        # Debugging for Loss
-        # import pdb; pdb.set_trace()
+        graphs_tuple = graph.data_dicts_to_graphs_tuple_pytorch(normalized_graphs)
+        targets_concat = torch.cat(batch_targets, dim=0).to(DEVICE)  # raw targets (not normalized)
 
         optimizer.zero_grad()
-        output_graphs_list = model(batch_graphs_tuple, num_processing_steps_tensor_for_model)
-        pred_nodes = output_graphs_list[-1]["nodes"]
+        outputs = model(graphs_tuple, num_processing_steps_tensor_for_model)
+        preds = outputs[-1]["nodes"]
 
-        l1_loss_val = F.l1_loss(pred_nodes, batch_targets_concat)
-        l2_loss_val = F.mse_loss(pred_nodes, batch_targets_concat)
-        rho_val = graph.pearson_corr_pytorch(pred_nodes, batch_targets_concat)
+        l1_loss_val = F.l1_loss(preds, targets_concat)
+        l2_loss_val = F.mse_loss(preds, targets_concat)
+        rho_val = graph.pearson_corr_pytorch(preds, targets_concat)
 
         l2_loss_val.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), clip_norm)
         optimizer.step()
 
-        l1s_train_epoch.append(l1_loss_val.item())
-        l2s_train_epoch.append(l2_loss_val.item())
-        rhos_train_epoch.append(rho_val.item())
+        l1s_train.append(l1_loss_val.item())
+        l2s_train.append(l2_loss_val.item())
+        rhos_train.append(rho_val.item())
 
-    L1_train = np.mean(l1s_train_epoch) if l1s_train_epoch else 0.0
-    L2_train = np.mean(l2s_train_epoch) if l2s_train_epoch else 0.0
-    rho_train = np.mean(rhos_train_epoch) if rhos_train_epoch else 0.0
-
+    L1_train, L2_train, rho_train = np.mean(l1s_train), np.mean(l2s_train), np.mean(rhos_train)
     l1_train_hist.append(L1_train)
     l2_train_hist.append(L2_train)
     rho_train_hist.append(rho_train)
 
-    # --- Test Loop ---
+    # ---- TEST PHASE ----
     model.eval()
-    l1s_test_epoch, l2s_test_epoch, rhos_test_epoch = [], [], []
-    test_preds_all, test_targets_all = [], []
-
+    l1s_test, l2s_test, rhos_test = [], [], []
     with torch.no_grad():
         for i in range(0, len(test_graph_dicts), batch_size):
-            batch_graphs_list = test_graph_dicts[i:i+batch_size]
-            batch_targets_list = test_targets[i:i+batch_size]
-
-            if not batch_graphs_list:
+            batch_graphs = test_graph_dicts[i:i + batch_size]
+            batch_targets = test_targets[i:i + batch_size]
+            if not batch_graphs:
                 continue
 
-            # CORRECT: Normalize the test data just before using it
-            normalized_test_graphs = []
-            for g in batch_graphs_list:
-                g_normalized = g.copy()
-                g_normalized["nodes"] = ((g_normalized["nodes"].cpu() - node_mean) / node_std).to(DEVICE)
-                if g_normalized["edges"].numel() > 0 and edge_mean is not None and edge_std is not None:
-                    g_normalized["edges"] = ((g_normalized["edges"].cpu() - edge_mean) / edge_std).to(DEVICE)
-                normalized_test_graphs.append(g_normalized)
+            normalized_graphs = []
+            for g in batch_graphs:
+                g_norm = g.copy()
+                g_norm["nodes"] = ((g_norm["nodes"].cpu() - node_mean) / node_std).to(DEVICE)
+                if g_norm["edges"].numel() > 0:
+                    g_norm["edges"] = ((g_norm["edges"].cpu() - edge_mean) / edge_std).to(DEVICE)
+                normalized_graphs.append(g_norm)
 
-            batch_graphs_tuple = graph.data_dicts_to_graphs_tuple_pytorch(normalized_test_graphs)
-            batch_targets_concat = torch.cat(batch_targets_list, dim=0).to(DEVICE)
-            output_graphs_list = model(batch_graphs_tuple, num_processing_steps_tensor_for_model)
-            pred_nodes_test = output_graphs_list[-1]["nodes"]
+            graphs_tuple = graph.data_dicts_to_graphs_tuple_pytorch(normalized_graphs)
+            targets_concat = torch.cat(batch_targets, dim=0).to(DEVICE)  # raw targets
 
-            l1s_test_epoch.append(F.l1_loss(pred_nodes_test, batch_targets_concat).item())
-            l2s_test_epoch.append(F.mse_loss(pred_nodes_test, batch_targets_concat).item())
-            rhos_test_epoch.append(graph.pearson_corr_pytorch(pred_nodes_test, batch_targets_concat).item())
-            
-    if DEVICE.type == 'cuda':
-        torch.cuda.empty_cache()
+            outputs = model(graphs_tuple, num_processing_steps_tensor_for_model)
+            preds_test = outputs[-1]["nodes"]
 
-    L1_test = np.mean(l1s_test_epoch) if l1s_test_epoch else 0.0
-    L2_test = np.mean(l2s_test_epoch) if l2s_test_epoch else 0.0
-    rho_test = np.mean(rhos_test_epoch) if rhos_test_epoch else 0.0
+            l1s_test.append(F.l1_loss(preds_test, targets_concat).item())
+            l2s_test.append(F.mse_loss(preds_test, targets_concat).item())
+            rhos_test.append(graph.pearson_corr_pytorch(preds_test, targets_concat).item())
 
+    L1_test, L2_test, rho_test = np.mean(l1s_test), np.mean(l2s_test), np.mean(rhos_test)
     l1_test_hist.append(L1_test)
     l2_test_hist.append(L2_test)
     rho_test_hist.append(rho_test)
-            
+
     print(f"Epoch {epoch+1:03d}: "
-          f" L2_train={L2_train:.4f}, rho_train={rho_train:.4f} | "
-          f" L2_test={L2_test:.4f}, rho_test={rho_test:.4f}")
+          f"L1_train={L1_train:.4f}, L2_train={L2_train:.4f}, rho_train={rho_train:.4f} | "
+          f"L1_test={L1_test:.4f}, L2_test={L2_test:.4f}, rho_test={rho_test:.4f}")
 
-    # --- TensorBoard Logging per Epoch ---
-    current_lr = optimizer.param_groups[0]['lr']
-    writer.add_scalar('Hyperparameters/Learning_Rate', current_lr, epoch)
-    writer.add_scalars('Loss/L1', {'train': L1_train, 'test': L1_test}, epoch)
-    writer.add_scalars('Loss/L2', {'train': L2_train, 'test': L2_test}, epoch)
-    writer.add_scalars('Correlation/rho', {'train': rho_train, 'test': rho_test}, epoch)
+print(f"✅ Training completed. Final rho_test = {rho_test:.4f}")
 
-    if (epoch + 1) % 10 == 0 or epoch == num_epochs - 1:
-        for name, param in model.named_parameters():
-            if param.grad is not None:
-                writer.add_histogram(f'Gradients/{name}', param.grad, epoch)
-            if param.data is not None:
-                writer.add_histogram(f'Weights/{name}', param.data, epoch)
+# ---------------------------------------------------------
+# 📊 Visualization
+# ---------------------------------------------------------
+epochs = np.arange(1, num_epochs + 1)
+plt.figure(figsize=(15, 5))
+
+plt.subplot(1, 3, 1)
+plt.plot(epochs, l1_train_hist, label='Train L1', linewidth=2)
+plt.plot(epochs, l1_test_hist, label='Test L1', linewidth=2)
+plt.xlabel('Epoch')
+plt.ylabel('L1 Loss')
+plt.title('Train vs Test L1 (Raw Targets)')
+plt.legend(); plt.grid(True, linestyle='--', alpha=0.6)
+
+plt.subplot(1, 3, 2)
+plt.plot(epochs, l2_train_hist, label='Train L2', linewidth=2)
+plt.plot(epochs, l2_test_hist, label='Test L2', linewidth=2)
+plt.xlabel('Epoch')
+plt.ylabel('L2 Loss')
+plt.title('Train vs Test L2 (Raw Targets)')
+plt.legend(); plt.grid(True, linestyle='--', alpha=0.6)
+
+plt.subplot(1, 3, 3)
+plt.plot(epochs, rho_train_hist, label='Train ρ', linewidth=2)
+plt.plot(epochs, rho_test_hist, label='Test ρ', linewidth=2)
+plt.xlabel('Epoch')
+plt.ylabel('Pearson ρ')
+plt.title('Train vs Test Correlation')
+plt.legend(); plt.grid(True, linestyle='--', alpha=0.6)
+
+plt.tight_layout()
+plt.savefig("training_results_features_norm_only.png", dpi=300)
+plt.show()
+
+print("✅ Results saved as 'training_results_features_norm_only.png'")
